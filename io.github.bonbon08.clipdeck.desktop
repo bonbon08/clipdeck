@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=clipdeck
+GenericName=Clip-Recorder
+Comment=Die letzten Sekunden des Bildschirms per Hotkey als Clip speichern
+Exec=clipdeck-gui
+Icon=camera-video
+Terminal=false
+Categories=AudioVideo;Video;Recorder;GTK;
+Keywords=clip;replay;recorder;screen;game;aufnahme;
+StartupNotify=true
+Actions=clip;
+
+[Desktop Action clip]
+Name=Clip speichern
+Exec=clipdeck clip

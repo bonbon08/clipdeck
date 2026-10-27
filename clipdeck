@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# clipdeck – Clip-Recorder für Linux.
+# Nimmt dauerhaft in einen Replay-Puffer auf; per Hotkey werden die letzten
+# CLIP_SECONDS Sekunden als Datei gespeichert. Backend: gpu-screen-recorder.
+
+set -euo pipefail
+
+APP=clipdeck
+VERSION=0.1.0
+SELF="$(readlink -f "$0")"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
+CONFIG_FILE="$CONFIG_DIR/config"
+USER_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+GSR_PATTERN='(^|/)gpu-screen-recorder( |$)'
+KB_SCHEMA=org.gnome.settings-daemon.plugins.media-keys
+KB_PATH=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/$APP-clip/
+CONFIG_KEYS=(CLIP_SECONDS FPS OUTPUT_DIR QUALITY CODEC CONTAINER CAPTURE AUDIO HOTKEY)
+
+# --- Standard-Konfiguration (überschreibbar in $CONFIG_FILE) ----------------
+CLIP_SECONDS=30                       # Länge des Replay-Puffers
+FPS=60
+OUTPUT_DIR="$HOME/Videos/Clips"
+QUALITY=very_high                     # medium | high | very_high | ultra
+CODEC=auto                            # auto | h264 | hevc | av1
+CONTAINER=mp4
+CAPTURE=portal                        # portal (Wayland) | screen | <Monitorname>
+AUDIO="default_output|default_input"  # Desktop + Mikrofon in einer Spur; "" = kein Ton
+HOTKEY=F8                             # GNOME-Tastenkürzel, z.B. "<Alt>F10"
+
+[[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
+
+die()    { echo "Fehler: $*" >&2; exit 1; }
+notify() { command -v notify-send >/dev/null && notify-send -a "clipdeck" -i camera-video "$@" || true; }
+
+gsr_cmd() {
+    if command -v gpu-screen-recorder >/dev/null; then
+        echo gpu-screen-recorder
+    elif flatpak info com.dec05eba.gpu_screen_recorder >/dev/null 2>&1; then
+        echo "flatpak run --command=gpu-screen-recorder com.dec05eba.gpu_screen_recorder"
+    else
+        die "gpu-screen-recorder nicht gefunden. Installieren mit:
+  yay -S gpu-screen-recorder        (AUR)
+  oder: flatpak install flathub com.dec05eba.gpu_screen_recorder"
+    fi
+}
+
+is_running() { pgrep -f -- "$GSR_PATTERN" >/dev/null; }
+
+# Läuft im Vordergrund (vom systemd-Service aufgerufen).
+cmd_run() {
+    mkdir -p "$OUTPUT_DIR"
+    local args=(-w "$CAPTURE" -f "$FPS" -r "$CLIP_SECONDS" -c "$CONTAINER"
+                -q "$QUALITY" -k "$CODEC" -o "$OUTPUT_DIR" -sc "$SELF")
+    [[ $CAPTURE == portal ]] && args+=(-restore-portal-session yes)
+    [[ -n $AUDIO ]] && args+=(-a "$AUDIO")
+    # shellcheck disable=SC2046
+    exec $(gsr_cmd) "${args[@]}"
+}
+
+# Wird von gpu-screen-recorder nach dem Speichern aufgerufen: $1 = Dateipfad.
+cmd_saved() {
+    local file=$1 name
+    name="Clip_$(date +%Y-%m-%d_%H-%M-%S).${file##*.}"
+    mv -n -- "$file" "$(dirname -- "$file")/$name" && file="$(dirname -- "$file")/$name"
+    notify "Clip gespeichert" "$name"
+    command -v paplay >/dev/null && [[ -f /usr/share/sounds/freedesktop/stereo/camera-shutter.oga ]] \
+        && paplay /usr/share/sounds/freedesktop/stereo/camera-shutter.oga &
+    echo "$file"
+}
+
+cmd_clip() {
+    is_running || { notify "Nicht aktiv" "Starte zuerst: $APP start"; die "Recorder läuft nicht."; }
+    pkill -USR1 -f -- "$GSR_PATTERN"
+}
+
+cmd_start()  { systemctl --user start "$APP.service" && echo "Aufnahme-Puffer läuft (${CLIP_SECONDS}s). Clip mit $HOTKEY."; }
+cmd_stop()   { systemctl --user stop "$APP.service" && echo "Gestoppt."; }
+cmd_status() { systemctl --user --no-pager status "$APP.service"; }
+cmd_open()   { mkdir -p "$OUTPUT_DIR"; xdg-open "$OUTPUT_DIR" >/dev/null 2>&1 & }
+cmd_logs()   { journalctl --user -u "$APP.service" -f; }
+
+# Gibt die aktive Konfiguration als KEY=VALUE aus (wird von der GUI gelesen).
+cmd_print_config() {
+    local k
+    for k in "${CONFIG_KEYS[@]}"; do printf '%s=%s\n' "$k" "${!k}"; done
+}
+
+cmd_hotkey() {
+    command -v gsettings >/dev/null || die "gsettings fehlt – Hotkey bitte manuell auf '$SELF clip' legen."
+    local list
+    list=$(gsettings get $KB_SCHEMA custom-keybindings)
+    if [[ $list != *"$KB_PATH"* ]]; then
+        if [[ $list == "@as []" || $list == "[]" ]]; then
+            list="['$KB_PATH']"
+        else
+            list="${list%]}, '$KB_PATH']"
+        fi
+        gsettings set $KB_SCHEMA custom-keybindings "$list"
+    fi
+    gsettings set "$KB_SCHEMA.custom-keybinding:$KB_PATH" name "clipdeck: Clip speichern"
+    gsettings set "$KB_SCHEMA.custom-keybinding:$KB_PATH" command "$SELF clip"
+    gsettings set "$KB_SCHEMA.custom-keybinding:$KB_PATH" binding "$HOTKEY"
+    echo "GNOME-Tastenkürzel $HOTKEY → '$APP clip' eingerichtet."
+}
+
+remove_hotkey() {
+    command -v gsettings >/dev/null || return 0
+    local list
+    list=$(gsettings get $KB_SCHEMA custom-keybindings)
+    list=$(sed -e "s#, '$KB_PATH'##; s#'$KB_PATH', ##; s#'$KB_PATH'##" <<<"$list")
+    gsettings set $KB_SCHEMA custom-keybindings "$list"
+    gsettings reset-recursively "$KB_SCHEMA.custom-keybinding:$KB_PATH" 2>/dev/null || true
+}
+
+# Einrichtung pro Benutzer: Konfiguration, Autostart, Hotkey.
+cmd_setup() {
+    gsr_cmd >/dev/null
+    mkdir -p "$CONFIG_DIR"
+    if [[ ! -f $CONFIG_FILE ]]; then
+        cmd_print_config | while IFS='=' read -r k v; do printf '%s=%q\n' "$k" "$v"; done > "$CONFIG_FILE"
+        echo "Konfiguration angelegt: $CONFIG_FILE"
+    fi
+
+    # Paketinstallation liefert die Unit mit; sonst eine eigene anlegen.
+    if ! systemctl --user cat "$APP.service" >/dev/null 2>&1; then
+        mkdir -p "$USER_UNIT_DIR"
+        cat > "$USER_UNIT_DIR/$APP.service" <<EOF
+[Unit]
+Description=clipdeck – Replay-Puffer für Clips
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=$SELF run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+        systemctl --user daemon-reload
+    fi
+    systemctl --user enable "$APP.service"
+    cmd_hotkey
+
+    echo
+    echo "Fertig. Jetzt starten mit:  $APP start   (oder über die App 'clipdeck')"
+    echo "Beim ersten Start fragt GNOME, welcher Bildschirm aufgenommen werden soll;"
+    echo "die Auswahl wird gespeichert. Clips landen in: $OUTPUT_DIR"
+}
+
+cmd_reset() {
+    systemctl --user disable --now "$APP.service" 2>/dev/null || true
+    rm -f "$USER_UNIT_DIR/$APP.service"
+    systemctl --user daemon-reload
+    remove_hotkey
+    echo "Autostart und Hotkey entfernt. Konfiguration ($CONFIG_DIR) und Clips bleiben erhalten."
+}
+
+usage() {
+    cat <<EOF
+clipdeck $VERSION – Clips der letzten Sekunden per Hotkey speichern
+
+Verwendung: $APP <befehl>
+
+  setup       Richtet Konfiguration, Autostart und GNOME-Hotkey ($HOTKEY) ein
+  start       Startet den Replay-Puffer
+  stop        Stoppt den Replay-Puffer
+  clip        Speichert die letzten ${CLIP_SECONDS}s als Clip
+  status      Zeigt den Service-Status
+  logs        Zeigt das Log live
+  open        Öffnet den Clip-Ordner
+  hotkey      Setzt den GNOME-Hotkey neu (nach Änderung von HOTKEY)
+  reset       Entfernt Autostart und Hotkey
+
+Grafische Oberfläche: clipdeck-gui
+Konfiguration: $CONFIG_FILE
+EOF
+}
+
+# gpu-screen-recorder ruft das -sc-Skript mit <dateipfad> <typ> auf.
+if [[ ${1:-} == /* && -f $1 ]]; then cmd_saved "$1"; exit; fi
+
+case "${1:-}" in
+    run)          cmd_run ;;
+    start)        cmd_start ;;
+    stop)         cmd_stop ;;
+    clip|save)    cmd_clip ;;
+    status)       cmd_status ;;
+    logs)         cmd_logs ;;
+    open)         cmd_open ;;
+    hotkey)       cmd_hotkey ;;
+    setup)        cmd_setup ;;
+    reset)        cmd_reset ;;
+    print-config) cmd_print_config ;;
+    -v|--version) echo "$APP $VERSION" ;;
+    *)            usage ;;
+esac

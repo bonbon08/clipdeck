@@ -1,0 +1,12 @@
+[Unit]
+Description=clipdeck – Replay-Puffer für Clips
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=@BINDIR@/clipdeck run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

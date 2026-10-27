@@ -1,0 +1,8 @@
+post_install() {
+  echo ">>> clipdeck: Als normaler Benutzer einmalig 'clipdeck setup' ausführen"
+  echo ">>> (Autostart + Hotkey F8) oder die App 'clipdeck' öffnen."
+}
+
+post_upgrade() {
+  echo ">>> clipdeck: Laufenden Puffer neu starten mit: systemctl --user restart clipdeck"
+}

@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""clipdeck-gui – GTK4/libadwaita-Oberfläche für clipdeck."""
+
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "io.github.bonbon08.clipdeck"
+VERSION = "0.1.0"
+SERVICE = "clipdeck.service"
+CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "clipdeck" / "config"
+VIDEO_EXT = {".mp4", ".mkv", ".flv", ".webm", ".mov"}
+CLIPS_SHOWN = 15
+
+FPS_OPTIONS = ["30", "60", "120", "144", "165", "240"]
+QUALITY_OPTIONS = [("medium", "Mittel"), ("high", "Hoch"), ("very_high", "Sehr hoch"), ("ultra", "Ultra")]
+CODEC_OPTIONS = [("auto", "Automatisch"), ("h264", "H.264"), ("hevc", "HEVC (H.265)"), ("av1", "AV1")]
+CONTAINER_OPTIONS = [("mp4", "MP4"), ("mkv", "MKV")]
+AUDIO_OPTIONS = [
+    ("default_output|default_input", "Desktop + Mikrofon"),
+    ("default_output", "Nur Desktop"),
+    ("default_input", "Nur Mikrofon"),
+    ("", "Kein Ton"),
+]
+
+
+def find_cli():
+    local = Path(__file__).resolve().parent / "clipdeck"
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    return shutil.which("clipdeck") or "clipdeck"
+
+
+CLI = find_cli()
+
+
+def run(*args, timeout=15):
+    """Führt einen Befehl aus und gibt (ok, ausgabe) zurück."""
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode == 0, (p.stdout + p.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+
+
+def systemctl(*args):
+    return run("systemctl", "--user", *args)
+
+
+def load_config():
+    ok, out = run(CLI, "print-config")
+    cfg = {}
+    if ok:
+        for line in out.splitlines():
+            key, _, value = line.partition("=")
+            cfg[key] = value
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# clipdeck-Konfiguration (wird auch von clipdeck-gui geschrieben)"]
+    lines += [f"{k}={shlex.quote(str(v))}" for k, v in cfg.items()]
+    CONFIG_FILE.write_text("\n".join(lines) + "\n")
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def combo_row(title, options, current, subtitle=None):
+    """ComboRow aus [(wert, label)]; gibt (row, werte) zurück."""
+    values = [o[0] for o in options]
+    row = Adw.ComboRow(title=title, model=Gtk.StringList.new([o[1] for o in options]))
+    if subtitle:
+        row.set_subtitle(subtitle)
+    if current in values:
+        row.set_selected(values.index(current))
+    return row, values
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="clipdeck", default_width=560, default_height=820)
+        self.cfg = load_config()
+        self.clip_listing = None
+
+        self.toasts = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        menu = Gio.Menu()
+        menu.append("Clip-Ordner öffnen", "win.open-folder")
+        menu.append("Über clipdeck", "win.about")
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
+        view.add_top_bar(header)
+
+        page = Adw.PreferencesPage()
+        page.add(self.build_status_group())
+        page.add(self.build_control_group())
+        page.add(self.build_settings_group())
+        page.add(self.build_clips_group())
+        view.set_content(page)
+        self.toasts.set_child(view)
+        self.set_content(self.toasts)
+
+        for name, cb in (("open-folder", self.on_open_folder), ("about", self.on_about)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", cb)
+            self.add_action(action)
+
+        if not shutil.which("gpu-screen-recorder") and not run("flatpak", "info", "com.dec05eba.gpu_screen_recorder")[0]:
+            self.toast("gpu-screen-recorder fehlt – bitte installieren (yay -S gpu-screen-recorder)", 0)
+
+        # Erster Start: Standardkonfiguration speichern und Hotkey anlegen.
+        if not CONFIG_FILE.exists() and self.cfg:
+            save_config(self.cfg)
+            run(CLI, "hotkey")
+
+        self.refresh()
+        GLib.timeout_add_seconds(2, self.refresh)
+
+    # --- Aufbau ---------------------------------------------------------------
+    def build_status_group(self):
+        group = Adw.PreferencesGroup()
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_bottom=12)
+        self.status_icon = Gtk.Image(icon_name="media-record-symbolic", pixel_size=64)
+        self.status_title = Gtk.Label(css_classes=["title-1"])
+        self.status_desc = Gtk.Label(css_classes=["dim-label"], wrap=True, justify=Gtk.Justification.CENTER)
+        self.clip_button = Gtk.Button(label="Clip speichern", halign=Gtk.Align.CENTER,
+                                      css_classes=["pill", "suggested-action"])
+        self.clip_button.connect("clicked", self.on_clip)
+        for w in (self.status_icon, self.status_title, self.status_desc, self.clip_button):
+            box.append(w)
+        group.add(box)
+        return group
+
+    def build_control_group(self):
+        group = Adw.PreferencesGroup()
+        self.active_row = Adw.SwitchRow(title="Aufnahme-Puffer",
+                                        subtitle="Nimmt im Hintergrund auf, damit Clips gespeichert werden können")
+        self.active_handler = self.active_row.connect("notify::active", self.on_toggle_active)
+        group.add(self.active_row)
+
+        self.autostart_row = Adw.SwitchRow(title="Beim Anmelden starten")
+        self.autostart_handler = self.autostart_row.connect("notify::active", self.on_toggle_autostart)
+        group.add(self.autostart_row)
+        return group
+
+    def build_settings_group(self):
+        group = Adw.PreferencesGroup(title="Einstellungen",
+                                     description="Änderungen werden mit „Übernehmen“ aktiv")
+        c = self.cfg
+
+        self.seconds_row = Adw.SpinRow.new_with_range(5, 600, 5)
+        self.seconds_row.set_title("Clip-Länge")
+        self.seconds_row.set_subtitle("Sekunden, die beim Speichern zurückliegen")
+        self.seconds_row.set_value(float(c.get("CLIP_SECONDS", 30)))
+        group.add(self.seconds_row)
+
+        fps = c.get("FPS", "60")
+        fps_opts = FPS_OPTIONS if fps in FPS_OPTIONS else FPS_OPTIONS + [fps]
+        self.fps_row, self.fps_values = combo_row("Bildrate", [(f, f"{f} FPS") for f in fps_opts], fps)
+        self.quality_row, self.quality_values = combo_row("Qualität", QUALITY_OPTIONS, c.get("QUALITY"))
+        self.codec_row, self.codec_values = combo_row("Video-Codec", CODEC_OPTIONS, c.get("CODEC"))
+        self.container_row, self.container_values = combo_row("Dateiformat", CONTAINER_OPTIONS, c.get("CONTAINER"))
+        self.audio_row, self.audio_values = combo_row("Ton", AUDIO_OPTIONS, c.get("AUDIO"))
+        for row in (self.fps_row, self.quality_row, self.codec_row, self.container_row, self.audio_row):
+            group.add(row)
+
+        self.folder = c.get("OUTPUT_DIR", str(Path.home() / "Videos" / "Clips"))
+        self.folder_row = Adw.ActionRow(title="Speicherort", subtitle=self.folder, activatable=True)
+        self.folder_row.add_suffix(Gtk.Image(icon_name="folder-open-symbolic"))
+        self.folder_row.connect("activated", self.on_pick_folder)
+        group.add(self.folder_row)
+
+        self.hotkey_row = Adw.EntryRow(title="Tastenkürzel (GNOME-Format, z.B. F8 oder <Alt>F10)",
+                                       text=c.get("HOTKEY", "F8"), use_markup=False)
+        group.add(self.hotkey_row)
+
+        apply_btn = Gtk.Button(label="Übernehmen", halign=Gtk.Align.END, margin_top=12,
+                               css_classes=["suggested-action"])
+        apply_btn.connect("clicked", self.on_apply)
+        group.add(apply_btn)
+        return group
+
+    def build_clips_group(self):
+        self.clips_group = Adw.PreferencesGroup(title="Letzte Clips")
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", valign=Gtk.Align.CENTER, css_classes=["flat"],
+                             tooltip_text="Aktualisieren")
+        refresh.connect("clicked", lambda *_: self.refresh_clips(force=True))
+        self.clips_group.set_header_suffix(refresh)
+        self.clip_rows = []
+        return self.clips_group
+
+    # --- Zustand --------------------------------------------------------------
+    def refresh(self):
+        active = systemctl("is-active", SERVICE)[1] in ("active", "activating")
+        enabled = systemctl("is-enabled", SERVICE)[1] == "enabled"
+
+        with self.active_row.handler_block(self.active_handler):
+            self.active_row.set_active(active)
+        with self.autostart_row.handler_block(self.autostart_handler):
+            self.autostart_row.set_active(enabled)
+
+        secs = self.cfg.get("CLIP_SECONDS", "30")
+        if active:
+            self.status_icon.set_css_classes(["error"])
+            self.status_title.set_label("Aufnahme läuft")
+            self.status_desc.set_label(f"Drücke {self.cfg.get('HOTKEY', 'F8')}, um die letzten {secs} s zu speichern")
+        else:
+            self.status_icon.set_css_classes(["dim-label"])
+            self.status_title.set_label("Pausiert")
+            self.status_desc.set_label("Schalte den Aufnahme-Puffer ein, um Clips speichern zu können")
+        self.clip_button.set_sensitive(active)
+        self.refresh_clips()
+        return GLib.SOURCE_CONTINUE
+
+    def refresh_clips(self, force=False):
+        folder = Path(self.folder)
+        try:
+            files = sorted((f for f in folder.iterdir() if f.suffix.lower() in VIDEO_EXT and f.is_file()),
+                           key=lambda f: f.stat().st_mtime, reverse=True)[:CLIPS_SHOWN]
+            listing = [(f, f.stat().st_mtime, f.stat().st_size) for f in files]
+        except OSError:
+            listing = []
+        if listing == self.clip_listing and not force:
+            return
+        self.clip_listing = listing
+
+        for row in self.clip_rows:
+            self.clips_group.remove(row)
+        self.clip_rows = []
+
+        if not listing:
+            row = Adw.ActionRow(title="Noch keine Clips", subtitle=str(folder))
+            self.clips_group.add(row)
+            self.clip_rows.append(row)
+            return
+
+        for path, mtime, size in listing:
+            when = datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M:%S")
+            row = Adw.ActionRow(title=GLib.markup_escape_text(path.name), subtitle=f"{when} · {human_size(size)}",
+                                activatable=True)
+            row.add_prefix(Gtk.Image(icon_name="video-x-generic-symbolic"))
+            row.add_suffix(Gtk.Image(icon_name="media-playback-start-symbolic"))
+            row.connect("activated", lambda _r, p=path: self.open_path(p))
+            self.clips_group.add(row)
+            self.clip_rows.append(row)
+
+    # --- Aktionen -------------------------------------------------------------
+    def toast(self, text, timeout=3):
+        t = Adw.Toast(title=text)
+        t.set_timeout(timeout)
+        self.toasts.add_toast(t)
+
+    def open_path(self, path):
+        Gio.AppInfo.launch_default_for_uri(Path(path).as_uri(), None)
+
+    def on_clip(self, _btn):
+        ok, out = run(CLI, "clip")
+        self.toast("Clip wird gespeichert …" if ok else f"Fehler: {out}")
+        # gpu-screen-recorder braucht einen Moment zum Schreiben.
+        GLib.timeout_add(1500, lambda: self.refresh_clips(force=True) or GLib.SOURCE_REMOVE)
+
+    def on_toggle_active(self, row, _pspec):
+        ok, out = systemctl("start" if row.get_active() else "stop", SERVICE)
+        if not ok:
+            self.toast(f"Fehler: {out or 'siehe clipdeck logs'}", 6)
+        GLib.timeout_add(800, lambda: self.refresh() and GLib.SOURCE_REMOVE)
+
+    def on_toggle_autostart(self, row, _pspec):
+        ok, out = systemctl("enable" if row.get_active() else "disable", SERVICE)
+        if not ok:
+            self.toast(f"Fehler: {out}", 6)
+        self.refresh()
+
+    def on_pick_folder(self, _row):
+        dialog = Gtk.FileDialog(title="Speicherort für Clips", initial_folder=Gio.File.new_for_path(self.folder))
+
+        def done(d, result):
+            try:
+                f = d.select_folder_finish(result)
+            except GLib.Error:
+                return
+            self.folder = f.get_path()
+            self.folder_row.set_subtitle(self.folder)
+
+        dialog.select_folder(self, None, done)
+
+    def on_apply(self, _btn):
+        hotkey = self.hotkey_row.get_text().strip() or "F8"
+        new = dict(self.cfg)
+        new.update(
+            CLIP_SECONDS=str(int(self.seconds_row.get_value())),
+            FPS=self.fps_values[self.fps_row.get_selected()],
+            QUALITY=self.quality_values[self.quality_row.get_selected()],
+            CODEC=self.codec_values[self.codec_row.get_selected()],
+            CONTAINER=self.container_values[self.container_row.get_selected()],
+            AUDIO=self.audio_values[self.audio_row.get_selected()],
+            OUTPUT_DIR=self.folder,
+            HOTKEY=hotkey,
+        )
+        hotkey_changed = new.get("HOTKEY") != self.cfg.get("HOTKEY")
+        save_config(new)
+        self.cfg = load_config() or new
+
+        msgs = ["Gespeichert"]
+        ok, out = run(CLI, "hotkey")
+        if not ok:
+            msgs.append(f"Hotkey-Fehler: {out}")
+        elif hotkey_changed:
+            msgs.append(f"Hotkey: {hotkey}")
+        if systemctl("is-active", SERVICE)[1] == "active":
+            systemctl("restart", SERVICE)
+            msgs.append("Aufnahme neu gestartet")
+        self.toast(" · ".join(msgs))
+        self.refresh_clips(force=True)
+        self.refresh()
+
+    def on_open_folder(self, *_):
+        Path(self.folder).mkdir(parents=True, exist_ok=True)
+        self.open_path(self.folder)
+
+    def on_about(self, *_):
+        Adw.AboutDialog(
+            application_name="clipdeck",
+            application_icon="camera-video",
+            version=VERSION,
+            comments="Speichert die letzten Sekunden deines Bildschirms per Hotkey als Clip.",
+            website="https://github.com/bonbon08/clipdeck",
+            license_type=Gtk.License.MIT_X11,
+            developers=["bonbon08"],
+        ).present(self)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self)
+        win.present()
+        # Sonst fokussiert GTK das Hotkey-Feld und scrollt nach unten.
+        GLib.idle_add(lambda: win.set_focus(None) or GLib.SOURCE_REMOVE)
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))
