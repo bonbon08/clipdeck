@@ -1,0 +1,25 @@
+pkgbase = clipdeck
+	pkgdesc = Replay-Clip-Recorder: speichert die letzten Sekunden des Bildschirms per Hotkey (GTK4-GUI)
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/bonbon08/clipdeck
+	install = clipdeck.install
+	arch = any
+	license = MIT
+	depends = bash
+	depends = gpu-screen-recorder
+	depends = python
+	depends = python-gobject
+	depends = gtk4
+	depends = libadwaita
+	depends = procps-ng
+	depends = systemd
+	optdepends = libnotify: Benachrichtigung nach dem Speichern
+	optdepends = libpulse: Auslöser-Sound nach dem Speichern
+	optdepends = sound-theme-freedesktop: Auslöser-Sound
+	optdepends = xdg-utils: clipdeck open
+	optdepends = gnome-settings-daemon: automatisch eingerichteter Hotkey
+	source = clipdeck-0.1.0.tar.gz::https://github.com/bonbon08/clipdeck/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = 247d5ee10543560f44089a0999d373c01daf214eedca301bf269785481b30960
+
+pkgname = clipdeck

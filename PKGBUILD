@@ -14,7 +14,7 @@ optdepends=('libnotify: Benachrichtigung nach dem Speichern'
             'gnome-settings-daemon: automatisch eingerichteter Hotkey')
 install=clipdeck.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('247d5ee10543560f44089a0999d373c01daf214eedca301bf269785481b30960')
 
 package() {
   cd "$pkgname-$pkgver"
